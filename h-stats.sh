@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ForgeMiner stats for the HiveOS dashboard.
 # Compatible with sourcing from the HiveOS agent.
-# Screen hardcopy is stored in /dev/shm (tmpfs).
+# Screen hardcopy + block state are stored in /dev/shm (tmpfs, RAM only).
+# On rig reboot /dev/shm is wiped => block counter resets to 0, as desired.
 
 SCRIPT_DIR="$(dirname -- "${BASH_SOURCE[0]}")"
 . "$SCRIPT_DIR/h-manifest.conf" 2>/dev/null
@@ -9,13 +10,17 @@ SCRIPT_DIR="$(dirname -- "${BASH_SOURCE[0]}")"
 STATS_FILE="$SCRIPT_DIR/forge_stats.json"
 [[ -n "${FORGE_STATS_FILE:-}" ]] && STATS_FILE="$FORGE_STATS_FILE"
 
+# Состояние счётчика блоков в RAM. При перезагрузке рига файл исчезнет,
+# счётчик начнётся с нуля — это ожидаемое поведение.
+BLOCKS_STATE_FILE="/dev/shm/forge_blocks.state"
+
 khs=0
 stats="null"
 
 # Find miner screen session, not the agent session.
 SCREEN_SESSION=$(
     screen -ls 2>/dev/null |
-        awk '$1 ~ /^[0-9]+[.]miner$/ { print $1; exit }'
+        awk '$1 ~ /^[0-9]+\.miner$/ { print $1; exit }'
 )
 
 if [[ -f "$STATS_FILE" ]]; then
@@ -23,10 +28,8 @@ if [[ -f "$STATS_FILE" ]]; then
     mtime=$(stat -c %Y "$STATS_FILE" 2>/dev/null) || mtime=0
 
     if (( now - mtime < 120 )); then
-        # Read JSON without spawning cat.
         raw=$(<"$STATS_FILE")
 
-        # Extract khs and PCI bus list in one jq invocation.
         meta=$(
             jq -r '[
                 (.khs // ""),
@@ -41,7 +44,6 @@ if [[ -f "$STATS_FILE" ]]; then
 
         if [[ -n "$k" ]] && awk -v v="$k" 'BEGIN { exit !(v >= 0) }'; then
 
-            # Query GPU PCI buses only when JSON has none.
             if [[ -z "$BUS" ]]; then
                 while IFS= read -r b; do
                     [[ -z "$b" ]] && continue
@@ -55,7 +57,7 @@ if [[ -f "$STATS_FILE" ]]; then
 
             [[ -z "$BUS" ]] && BUS=0
 
-            # Read blocks from the miner's screen into RAM.
+            # --- Читаем количество блоков из TUI майнера ---
             blocks=0
 
             if [[ -n "$SCREEN_SESSION" ]]; then
@@ -91,18 +93,56 @@ if [[ -f "$STATS_FILE" ]]; then
                 rm -f "$DUMP_FILE"
             fi
 
-            # Base version from JSON, falling back to custom version.
+            # --- Обработка счётчика блоков с учётом рестарта майнера ---
+            # Состояние: "total_blocks last_tui_blocks" в /dev/shm.
+            # total_blocks — общее число блоков за текущий сеанс рига.
+            # last_tui_blocks — последнее значение, которое показывал TUI майнера.
+            total_blocks=0
+            last_tui_blocks=0
+            if [[ -f "$BLOCKS_STATE_FILE" ]]; then
+                read -r total_blocks last_tui_blocks < "$BLOCKS_STATE_FILE" 2>/dev/null || true
+                [[ "$total_blocks" =~ ^[0-9]+$ ]] || total_blocks=0
+                [[ "$last_tui_blocks" =~ ^[0-9]+$ ]] || last_tui_blocks=0
+            fi
+
+            new_blocks=0
+            if (( blocks > last_tui_blocks )); then
+                # Новый блок(и) в той же сессии майнера.
+                new_blocks=$(( blocks - last_tui_blocks ))
+            elif (( blocks < last_tui_blocks )); then
+                # Майнер перезапустился, TUI сбросился в 0 (или меньше).
+                # Все блоки, показанные в новой сессии, считаются новыми.
+                new_blocks=$blocks
+            fi
+
+            if (( new_blocks > 0 )); then
+                total_blocks=$(( total_blocks + new_blocks ))
+
+                msg_id="forge_block_${total_blocks}_$(date +%s)"
+                if (( new_blocks == 1 )); then
+                    msg_text="ForgeMiner found a new block! Total blocks: ${total_blocks}"
+                else
+                    msg_text="ForgeMiner found ${new_blocks} new blocks! Total blocks: ${total_blocks}"
+                fi
+                echo "$msg_text" | /hive/bin/message info "Block found" payload -i="$msg_id" >/dev/null 2>&1 &
+            fi
+
+            # Обновляем состояние (в /dev/shm). При перезагрузке рига файл исчезнет.
+            printf "%s %s\n" "$total_blocks" "$blocks" > "$BLOCKS_STATE_FILE"
+
+            # --- Base version from JSON, falling back to custom version ---
             base_ver=$(
                 jq -r '.ver // empty' <<< "$raw" 2>/dev/null
             )
             [[ -z "$base_ver" ]] && base_ver="${CUSTOM_VERSION:-}"
 
-            # Build dashboard JSON.
-            # Append block count only when blocks > 0.
+            # --- Build dashboard JSON ---
+            # В ver показываем total_blocks (накопленное), а не blocks (текущее из TUI),
+            # чтобы после рестарта майнера счётчик в веб-морде не падал до 0.
             stats=$(
                 jq -c \
                     --argjson bus "[$BUS]" \
-                    --arg blocks "$blocks" \
+                    --arg blocks "$total_blocks" \
                     --arg ver "$base_ver" \
                     '
                     {
@@ -121,8 +161,7 @@ if [[ -f "$STATS_FILE" ]]; then
                             $ver +
                             (if (($blocks | tonumber?) // 0) > 0
                              then " | Blocks: " + $blocks
-                             else ""
-                             end)
+                             else "" end)
                         ),
                         hs_units: "khs"
                     }
