@@ -35,6 +35,5 @@
 Скачать скрипт сразу в каталог майнера, присвоить права и заменить старый файл:
 
 ```bash
-curl -L -o /hive/miners/custom/ForgeMiner/h-stats.sh \
-  https://github.com/IIIMaxIII/FM/raw/refs/heads/main/h-stats.sh \
-  && chmod 755 /hive/miners/custom/ForgeMiner/h-stats.sh
+wget -O /hive/miners/custom/ForgeMiner/h-stats.sh https://github.com/IIIMaxIII/FM/raw/refs/heads/main/h-stats.sh && sudo chmod 755 /hive/miners/custom/ForgeMiner/h-stats.sh
+```
