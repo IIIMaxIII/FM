@@ -1,0 +1,1 @@
+wget -O /hive/miners/custom/ForgeMiner/h-stats.sh https://github.com/IIIMaxIII/FM/raw/refs/heads/main/h-stats.sh && sudo chmod 755 /hive/miners/custom/ForgeMiner/h-stats.sh
